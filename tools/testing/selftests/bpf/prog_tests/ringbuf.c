@@ -5,6 +5,7 @@
 #include <test_progs.h>
 #include <sys/mman.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 #include <time.h>
 #include <sched.h>
 #include <signal.h>
@@ -14,6 +15,7 @@
 #include <linux/ring_buffer.h>
 #include "test_ringbuf.lskel.h"
 #include "test_ringbuf_map_key.lskel.h"
+#include "test_ringbuf_overflow.skel.h"
 
 #define EDONE 7777
 
@@ -61,6 +63,7 @@ static int process_sample(void *ctx, void *data, size_t len)
 
 static struct test_ringbuf_map_key_lskel *skel_map_key;
 static struct test_ringbuf_lskel *skel;
+static struct test_ringbuf_overflow *skel_overflow;
 static struct ring_buffer *ringbuf;
 
 static void trigger_samples()
@@ -319,6 +322,89 @@ static int process_map_key_sample(void *ctx, void *data, size_t len)
 	}
 }
 
+/* uprobe attach point */
+static noinline void trigger_ringbuf_overflow(int v)
+{
+	asm volatile("");
+}
+
+struct process_overflow_ctx {
+	uint64_t called;
+	uint64_t desired;
+	uint64_t prev_called;
+	clock_t  prev_time;
+};
+
+static int process_overflow(void *ctx, void *data, size_t len)
+{
+	struct process_overflow_ctx *overflow_ctx = ctx;
+	overflow_ctx->called += 1;
+	const uint64_t threshold = 1 << 20;
+	if (overflow_ctx->called % threshold == 0) {
+		clock_t now = clock();
+		double duration = ((double)now - overflow_ctx->prev_time) /
+				  CLOCKS_PER_SEC;
+		int processed =
+			overflow_ctx->called - overflow_ctx->prev_called;
+		const uint64_t reservation_size = (1 << 29) - 16;
+		double throughput_bytes = (double)(reservation_size) *
+					  ((double)(processed) / duration);
+		double throughput_gibibytes =
+			throughput_bytes / (double)(1 << 30);
+		printf("throughput: %f GiB/s duration %fs (%lx/%lx; %f%%) \n",
+		       throughput_gibibytes, duration, overflow_ctx->called,
+		       overflow_ctx->desired,
+		       100 * ((double)overflow_ctx->called) /
+			       ((double)overflow_ctx->desired));
+		overflow_ctx->prev_time = now;
+		overflow_ctx->prev_called = overflow_ctx->called;
+	}
+	if (overflow_ctx->called > overflow_ctx->desired)
+		return -42;
+	trigger_ringbuf_overflow(1);
+	return 0;
+}
+
+static void ringbuf_overflow_subtest(void)
+{
+	DECLARE_LIBBPF_OPTS(bpf_uprobe_opts, uprobe_opts);
+
+	skel_overflow = test_ringbuf_overflow__open_and_load();
+	if (!ASSERT_OK_PTR(skel_overflow,
+			   "test_ringbuf_overflow_uint32_lskel__open"))
+		return;
+
+	ssize_t offset = get_uprobe_offset(&trigger_ringbuf_overflow);
+	if (!ASSERT_GE(offset, 0, "uprobe_offset"))
+		goto cleanup;
+	uprobe_opts.retprobe = false;
+	skel_overflow->links.trigger_ringbuf_overflow =
+		bpf_program__attach_uprobe_opts(
+			skel_overflow->progs.trigger_ringbuf_overflow, 0,
+			"/proc/self/exe", offset, &uprobe_opts);
+	if (!ASSERT_OK_PTR(skel_overflow->links.trigger_ringbuf_overflow,
+			   "link"))
+		goto cleanup;
+
+	struct process_overflow_ctx ctx = {
+		.called = 0,
+		.desired = (ULONG_MAX / ((1ull<<29) - 16)) + (1<<30),
+		.prev_called = 0,
+		.prev_time = clock(),
+	};
+	ringbuf = ring_buffer__new(bpf_map__fd(skel_overflow->maps.ringbuf),
+				   process_overflow, &ctx, NULL);
+	if (!ASSERT_OK_PTR(ringbuf, "ring_buffer__new"))
+		goto cleanup;
+
+	trigger_ringbuf_overflow(1);
+	int err = ring_buffer__consume(ringbuf);
+	ASSERT_EQ(err, -42, "ring_buffer__consume");
+	ring_buffer__free(ringbuf);
+cleanup:
+	test_ringbuf_overflow__destroy(skel_overflow);
+}
+
 static void ringbuf_map_key_subtest(void)
 {
 	int err;
@@ -360,4 +446,6 @@ void test_ringbuf(void)
 		ringbuf_subtest();
 	if (test__start_subtest("ringbuf_map_key"))
 		ringbuf_map_key_subtest();
+	if (test__start_subtest("ringbuf_overflow"))
+		ringbuf_overflow_subtest();
 }
